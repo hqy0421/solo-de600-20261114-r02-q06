@@ -1,6 +1,9 @@
+from math import factorial
+
 import numpy as np
 import pandas as pd
 import pytest
+from scipy.stats import chi2 as sp_chi2
 from scipy.stats import chi2_contingency
 
 import pingouin as pg
@@ -218,3 +221,290 @@ def test_dichotomous_crosstab():
     np.testing.assert_array_equal(
         pg.dichotomous_crosstab(data_ct, "A", "E").to_numpy(), [[0, 3], [0, 1]]
     )
+
+
+# 3-way count table (channel x customer type x plan); the "trial" plan is not
+# sold through the "partner" channel (structural zeros).
+cells_3way = pd.DataFrame(
+    {
+        "channel": ["web"] * 6 + ["partner"] * 4,
+        "ctype": ["new"] * 3 + ["old"] * 3 + ["new"] * 2 + ["old"] * 2,
+        "plan": ["basic", "pro", "trial"] * 2 + ["basic", "pro"] * 2,
+        "n": [40, 25, 12, 30, 18, 4, 22, 15, 26, 13],
+    }
+)
+sz_3way = pd.DataFrame({"channel": ["partner"], "plan": ["trial"]})
+
+
+@pytest.mark.filterwarnings("ignore:Low count:UserWarning")
+def test_loglinear():
+    """Test function loglinear."""
+    # ----- Two-way independence: equivalence with chi2_independence -----
+    expected, observed, stats = pg.loglinear(df_ind, x=["sex", "target"], n_mcmc=None, seed=42)
+    exp_chi2, _, stats_chi2 = pg.chi2_independence(df_ind, "sex", "target", correction=False)
+    exp_wide = expected.pivot(index="sex", columns="target", values="expected")
+    exp_wide = exp_wide.sort_index().sort_index(axis=1)
+    np.testing.assert_allclose(
+        exp_wide.to_numpy(), exp_chi2.sort_index().sort_index(axis=1).to_numpy(), rtol=1e-8
+    )
+    assert stats.at[0, "test"] == "pearson"
+    assert stats.at[1, "test"] == "log-likelihood"
+    # Pearson X2 and likelihood-ratio G2 match chi2_independence (lambda 1 and 0)
+    assert np.isclose(stats.at[0, "chi2"], stats_chi2.at[0, "chi2"])
+    assert np.isclose(stats.at[1, "chi2"], stats_chi2.at[2, "chi2"])
+    assert stats.at[0, "dof"] == stats_chi2.at[0, "dof"] == 1
+    assert np.isclose(stats.at[0, "p_asymp"], stats_chi2.at[0, "pval"])
+    assert np.isclose(stats.at[1, "p_asymp"], stats_chi2.at[2, "pval"])
+    # No exact test requested
+    assert stats["p_exact"].isna().all() and stats["mc_se"].isna().all()
+    # Observed table matches the crosstab, no structural zeros
+    obs_wide = observed.pivot(index="sex", columns="target", values="observed")
+    obs_wide = obs_wide.sort_index().sort_index(axis=1)
+    np.testing.assert_array_equal(obs_wide.to_numpy(), pd.crosstab(df_ind.sex, df_ind.target))
+    assert not observed["structural_zero"].any()
+
+    # ----- Three-way model with interactions: sufficient margins are preserved -----
+    expected, observed, stats = pg.loglinear(
+        cells_3way,
+        x=["channel", "ctype", "plan"],
+        count="n",
+        interactions=[("channel", "ctype"), ("ctype", "plan")],
+        structural_zeros=sz_3way,
+        seed=42,
+    )
+    for margins in (["channel", "ctype"], ["ctype", "plan"], ["channel"], ["ctype"], ["plan"]):
+        exp_margin = expected.groupby(margins, observed=True)["expected"].sum()
+        obs_margin = observed.groupby(margins, observed=True)["observed"].sum()
+        np.testing.assert_allclose(exp_margin.to_numpy(), obs_margin.to_numpy(), atol=1e-6)
+    # Structural zeros are excluded from the fit, not treated as zero counts
+    sz_cells = expected[expected["structural_zero"]]
+    assert len(sz_cells) == 2
+    assert (sz_cells["expected"] == 0).all()
+    assert (observed.loc[observed["structural_zero"], "observed"] == 0).all()
+    # dof: 10 non-structural cells - rank 8 (4 + 6 - 2 for the shared ctype margin)
+    assert stats.at[0, "dof"] == 2
+    assert 0 < stats.at[0, "p_exact"] <= 1 and stats.at[0, "mc_se"] > 0
+
+    # Declaring the structural zeros changes the fit (they are not sampling zeros)
+    expected_nosz, _, stats_nosz = pg.loglinear(
+        cells_3way,
+        x=["channel", "ctype", "plan"],
+        count="n",
+        interactions=[("channel", "ctype"), ("ctype", "plan")],
+        n_mcmc=None,
+    )
+    assert stats_nosz.at[0, "dof"] == 4  # 12 cells - rank 8
+    assert not np.allclose(expected["expected"], expected_nosz["expected"])
+
+    # ----- Cross-validation against a Poisson GLM (statsmodels) -----
+    # The expected frequencies, dof, X2 and G2 must match the equivalent GLM
+    # fitted on the non-structural cells only.
+    import statsmodels.api as sm
+    import statsmodels.formula.api as smf
+
+    fit = expected.loc[~expected["structural_zero"], ["channel", "ctype", "plan", "expected"]]
+    fit["n"] = observed.loc[~observed["structural_zero"], "observed"].to_numpy()
+    glm = smf.glm("n ~ channel*ctype + ctype*plan", data=fit, family=sm.families.Poisson()).fit()
+    np.testing.assert_allclose(fit["expected"], glm.fittedvalues, atol=1e-6)
+    assert glm.df_resid == stats.at[0, "dof"]
+    assert np.isclose(glm.pearson_chi2, stats.at[0, "chi2"])
+    assert np.isclose(glm.deviance, stats.at[1, "chi2"])
+
+    # ----- Structural zeros reduce the degrees of freedom (quasi-independence) -----
+    # 3x3 table with structural zeros on the diagonal: dof = 6 cells - rank 5 = 1
+    tab_qi = pd.DataFrame(
+        {
+            "r": [0, 0, 1, 1, 2, 2],
+            "c": [1, 2, 0, 2, 0, 1],
+            "n": [5, 3, 2, 6, 4, 1],
+        }
+    )
+    sz_diag = pd.DataFrame({"r": [0, 1, 2], "c": [0, 1, 2]})
+    expected, _, stats = pg.loglinear(
+        tab_qi, x=["r", "c"], count="n", structural_zeros=sz_diag, n_mcmc=None
+    )
+    assert stats.at[0, "dof"] == 1
+    assert (expected.loc[expected["structural_zero"], "expected"] == 0).all()
+    # Row and column margins are preserved on the non-structural cells
+    for margins in (["r"], ["c"]):
+        np.testing.assert_allclose(
+            expected.groupby(margins)["expected"].sum().to_numpy(),
+            tab_qi.groupby(margins)["n"].sum().to_numpy(),
+            atol=1e-6,
+        )
+    # p_asymp matches the chi-squared survival function with the adjusted dof
+    assert np.isclose(stats.at[0, "p_asymp"], sp_chi2.sf(stats.at[0, "chi2"], 1))
+
+    # ----- Count-column input equals long-format input -----
+    rows = cells_3way.loc[cells_3way.index.repeat(cells_3way["n"]), ["channel", "ctype", "plan"]]
+    kwargs = dict(
+        x=["channel", "ctype", "plan"],
+        interactions=[("channel", "ctype"), ("ctype", "plan")],
+        structural_zeros=sz_3way,
+        seed=42,
+    )
+    exp_count, _, stats_count = pg.loglinear(cells_3way, count="n", **kwargs)
+    exp_long, _, stats_long = pg.loglinear(rows, **kwargs)
+    pd.testing.assert_frame_equal(exp_count, exp_long)
+    pd.testing.assert_frame_equal(stats_count, stats_long)
+
+    # ----- Hierarchical reduction: redundant terms do not change the model -----
+    exp1, _, stats1 = pg.loglinear(
+        cells_3way,
+        x=["channel", "ctype", "plan"],
+        count="n",
+        interactions=[("channel", "ctype"), ("channel",), ("ctype",)],
+        structural_zeros=sz_3way,
+        n_mcmc=None,
+    )
+    exp2, _, stats2 = pg.loglinear(
+        cells_3way,
+        x=["channel", "ctype", "plan"],
+        count="n",
+        interactions=[("channel", "ctype")],
+        structural_zeros=sz_3way,
+        n_mcmc=None,
+    )
+    pd.testing.assert_frame_equal(exp1, exp2)
+    pd.testing.assert_frame_equal(stats1, stats2)
+
+    # ----- Rows with missing values are removed -----
+    cells_nan = pd.concat(
+        [
+            cells_3way,
+            pd.DataFrame({"channel": [None], "ctype": ["new"], "plan": ["pro"], "n": [5]}),
+        ],
+        ignore_index=True,
+    )
+    exp_nan, _, _ = pg.loglinear(
+        cells_nan,
+        x=["channel", "ctype", "plan"],
+        count="n",
+        interactions=[("channel", "ctype"), ("ctype", "plan")],
+        structural_zeros=sz_3way,
+        n_mcmc=None,
+    )
+    pd.testing.assert_frame_equal(exp_nan, exp_count)
+
+    # ----- Saturated model: dof = 0, tests are not informative -----
+    with pytest.warns(UserWarning, match="saturated"):
+        _, _, stats_sat = pg.loglinear(
+            df_ind, x=["sex", "target"], interactions=[("sex", "target")]
+        )
+    assert stats_sat.at[0, "dof"] == 0
+    assert stats_sat["p_asymp"].isna().all() and stats_sat["p_exact"].isna().all()
+
+    # ----- Also registered as a DataFrame method -----
+    _, _, stats_method = df_ind.loglinear(x=["sex", "target"], n_mcmc=None)
+    assert stats_method.at[0, "dof"] == 1
+
+
+def test_loglinear_exact_conditional():
+    """Test the exact conditional p-value of loglinear against enumeration."""
+    # 2x2 table with fixed margins: the fiber has only 6 tables, enumerable by hand
+    tab = pd.DataFrame({"r": [0, 0, 1, 1], "c": [0, 1, 0, 1], "n": [2, 5, 4, 1]})
+    expected, _, stats = pg.loglinear(tab, x=["r", "c"], count="n", n_mcmc=20000, seed=42)
+    exp2x2 = expected["expected"].to_numpy().reshape(2, 2)
+
+    def exact_pvalue(stat_obs, stat_fun):
+        """Exact conditional p-value by enumeration of the 2x2 fiber."""
+        weights, stats_fiber = [], []
+        for a in range(1, 7):  # tables [[a, 7-a], [6-a, a-1]] have the same margins
+            table = np.array([[a, 7 - a], [6 - a, a - 1]], dtype=float)
+            weights.append(np.prod([1 / factorial(int(v)) for v in table.ravel()]))
+            stats_fiber.append(stat_fun(table))
+        weights = np.asarray(weights)
+        weights /= weights.sum()
+        return weights[np.asarray(stats_fiber) >= stat_obs - 1e-10].sum()
+
+    def pearson(table):
+        return ((table - exp2x2) ** 2 / exp2x2).sum()
+
+    def loglik(table):
+        pos = table > 0
+        return 2 * (table[pos] * np.log(table[pos] / exp2x2[pos])).sum()
+
+    p_true_x2 = exact_pvalue(stats.at[0, "chi2"], pearson)
+    p_true_g2 = exact_pvalue(stats.at[1, "chi2"], loglik)
+    assert np.isclose(p_true_x2, 32 / 132)  # hand-checked value
+    # The Monte Carlo estimates match the enumerated exact p-values
+    assert abs(stats.at[0, "p_exact"] - p_true_x2) < 4 * stats.at[0, "mc_se"] + 1e-3
+    assert abs(stats.at[1, "p_exact"] - p_true_g2) < 4 * stats.at[1, "mc_se"] + 1e-3
+    # ... while the asymptotic p-values are far off on this small sample
+    assert abs(stats.at[0, "p_asymp"] - p_true_x2) > 0.1
+
+    # Reproducibility: same seed, same p-values
+    _, _, stats_rep = pg.loglinear(tab, x=["r", "c"], count="n", n_mcmc=20000, seed=42)
+    pd.testing.assert_frame_equal(stats, stats_rep)
+
+    # The MCMC chain preserves the sufficient margins and the structural zeros
+    # 2x3 table with a structural zero at cell (0, 1), independence model
+    obs = np.array([2, 0, 4, 1, 3, 2], dtype=float)
+    allowed = np.array([True, False, True, True, True, True])
+    gen_sets = [frozenset({0}), frozenset({1})]
+    gen_buckets = [np.repeat(np.arange(2), 3), np.tile(np.arange(3), 2)]
+    rng = np.random.default_rng(12345)
+    _, last = pg.contingency._loglinear_mcmc(
+        obs, obs.copy(), allowed, (2, 3), gen_sets, gen_buckets, 2000, 200, rng
+    )
+    assert last[1] == 0  # structural zero untouched
+    tab_last = last.reshape(2, 3)
+    np.testing.assert_array_equal(tab_last.sum(axis=0), obs.reshape(2, 3).sum(axis=0))
+    np.testing.assert_array_equal(tab_last.sum(axis=1), obs.reshape(2, 3).sum(axis=1))
+    assert not np.array_equal(last, obs)  # the chain did move
+
+
+def test_loglinear_validation():
+    """Test the input validation of loglinear."""
+    kwargs = dict(x=["channel", "ctype", "plan"], count="n", n_mcmc=None)
+
+    def expect_error(error, *params, **kw):
+        with pytest.raises(error):
+            pg.loglinear(*params, **kw)
+
+    expect_error(TypeError, 1, **kwargs)  # data not a DataFrame
+    expect_error(ValueError, cells_3way, x=["channel"], count="n")  # less than two columns
+    expect_error(ValueError, cells_3way, x=["channel", "channel"], count="n")  # duplicated
+    expect_error(TypeError, cells_3way, x=["channel", 1.5, "plan"], count="n")  # invalid name
+    expect_error(ValueError, cells_3way, x=["channel", "ctype", "unknown"], count="n")
+    expect_error(TypeError, cells_3way, interactions="channel", **kwargs)  # not a list
+    expect_error(TypeError, cells_3way, interactions=["channel"], **kwargs)  # string term
+    expect_error(ValueError, cells_3way, interactions=[()], **kwargs)  # empty term
+    expect_error(ValueError, cells_3way, interactions=[("channel", "unknown")], **kwargs)
+    expect_error(TypeError, cells_3way, **{**kwargs, "count": 1.5})  # count not a name
+    expect_error(ValueError, cells_3way, **{**kwargs, "count": "unknown"})
+    expect_error(TypeError, cells_3way, structural_zeros=[("partner", "trial")], **kwargs)
+    expect_error(ValueError, cells_3way, structural_zeros=pd.DataFrame({"unknown": [1]}), **kwargs)
+    expect_error(ValueError, cells_3way, **{**kwargs, "burn_in": -1})
+    expect_error(ValueError, cells_3way, **{**kwargs, "n_mcmc": -5})
+
+    # Invalid counts
+    expect_error(ValueError, cells_3way.assign(n=-1), **kwargs)  # negative
+    expect_error(ValueError, cells_3way.assign(n=1.5), **kwargs)  # non-integer
+    expect_error(ValueError, cells_3way.assign(n=np.nan), **kwargs)  # missing
+    expect_error(TypeError, cells_3way.assign(n="a"), **kwargs)  # non-numeric
+    expect_error(ValueError, cells_3way.assign(n=0), **kwargs)  # all-zero table
+
+    # Structural-zero cells must have a zero observed count
+    sz_bad = pd.DataFrame({"channel": ["web"], "plan": ["basic"]})
+    expect_error(ValueError, cells_3way, structural_zeros=sz_bad, **kwargs)
+    # All cells cannot be structural zeros
+    sz_all = cells_3way[["channel", "ctype", "plan"]].drop_duplicates()
+    sz_all = pd.concat(
+        [
+            sz_all,
+            pd.DataFrame(
+                {"channel": ["partner"] * 2, "ctype": ["new", "old"], "plan": ["trial"] * 2}
+            ),
+        ]
+    )
+    expect_error(ValueError, cells_3way, structural_zeros=sz_all, **kwargs)
+    # A structural-zero row that matches no cell warns
+    with pytest.warns(UserWarning, match="matches no cell"):
+        pg.loglinear(
+            cells_3way,
+            structural_zeros=pd.DataFrame({"channel": ["pigeon"]}),
+            **kwargs,
+        )
+    # No data at all
+    expect_error(ValueError, cells_3way.assign(channel=None), **kwargs)

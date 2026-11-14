@@ -63,6 +63,7 @@ Contingency
    chi2_independence
    chi2_mcnemar
    dichotomous_crosstab
+   loglinear
 
 .. _correlations:
 

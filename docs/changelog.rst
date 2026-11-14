@@ -13,6 +13,7 @@ Unreleased
 
 **New features**
 
+- New :py:func:`pingouin.loglinear` function for hierarchical log-linear analysis of multiway contingency tables. It fits the expected frequencies of the model defined by the selected interaction terms (whose margins are preserved) with iterative proportional fitting, supports structural zeros (impossible cell combinations, excluded from the fit and from the degrees of freedom instead of being treated as ordinary zero counts), and reports exact conditional p-values estimated by Metropolis-Hastings sampling over the tables that share the sufficient margins -- a genuine small-sample exact test, unlike the asymptotic chi-squared p-value which is also reported.
 - :py:func:`pingouin.corr`: new ``seed`` argument for the bootstrap of the Shepherd's pi correlation (``method="shepherd"``). Without it, the global NumPy random state is used, as before.
 
 **Breaking changes**

@@ -504,7 +504,7 @@ The functions that are currently supported as pandas method are:
 * Post-hocs: :py:func:`~pingouin.pairwise_tests`, :py:func:`~pingouin.pairwise_tukey`, :py:func:`~pingouin.pairwise_gameshowell`, :py:func:`~pingouin.ptests`
 * Correlations: :py:func:`~pingouin.pairwise_corr`, :py:func:`~pingouin.partial_corr`, :py:func:`~pingouin.pcorr`, :py:func:`~pingouin.rcorr`, :py:func:`~pingouin.rm_corr`
 * Distribution: :py:func:`~pingouin.normality`, :py:func:`~pingouin.homoscedasticity`, :py:func:`~pingouin.sphericity`, :py:func:`~pingouin.epsilon`, :py:func:`~pingouin.box_m`
-* Contingency: :py:func:`~pingouin.chi2_independence`, :py:func:`~pingouin.chi2_mcnemar`, :py:func:`~pingouin.dichotomous_crosstab`
+* Contingency: :py:func:`~pingouin.chi2_independence`, :py:func:`~pingouin.chi2_mcnemar`, :py:func:`~pingouin.dichotomous_crosstab`, :py:func:`~pingouin.loglinear`
 * Regression: :py:func:`~pingouin.linear_regression`, :py:func:`~pingouin.logistic_regression`, :py:func:`~pingouin.mediation_analysis`
 * Reliability: :py:func:`~pingouin.cronbach_alpha`, :py:func:`~pingouin.intraclass_corr`
 
